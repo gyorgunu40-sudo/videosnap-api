@@ -1,5 +1,6 @@
 from flask import Flask, request, jsonify, Response
-import yt_dlp, os, tempfile, re
+import os, requests
+from urllib.parse import urlparse
 
 app = Flask(__name__)
 
@@ -10,24 +11,46 @@ ALLOWED_HOSTS = [
     'twitter.com', 'www.twitter.com', 'x.com', 'www.x.com',
 ]
 
-FORMAT_MAP = {
-    'mp4-720':  'bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best[height<=720]',
-    'mp4-1080': 'bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080][ext=mp4]/best[height<=1080]',
-    'mp3':      'bestaudio/best',
-}
-
 API_KEY = os.environ.get('API_KEY', 'changeme')
+COBALT_API = 'https://api.cobalt.tools'
 
 def check_key():
     return request.headers.get('X-API-Key') == API_KEY
 
 def validate_url(url):
-    from urllib.parse import urlparse
     try:
-        h = urlparse(url).netloc.lower().lstrip('www.')
+        h = urlparse(url).netloc.lower()
+        if h.startswith('www.'): h = h[4:]
         return any(h == a or h.endswith('.' + a) for a in ALLOWED_HOSTS)
     except:
         return False
+
+def detect_platform(url):
+    host = urlparse(url).netloc.lower()
+    if 'youtube' in host or 'youtu.be' in host: return 'youtube'
+    if 'tiktok' in host: return 'tiktok'
+    if 'instagram' in host: return 'instagram'
+    return 'twitter'
+
+def cobalt_request(url, fmt):
+    is_audio = fmt == 'mp3'
+    payload = {
+        'url': url,
+        'videoQuality': '1080' if fmt == 'mp4-1080' else '720',
+        'audioFormat': 'mp3',
+        'downloadMode': 'audio' if is_audio else 'auto',
+        'filenameStyle': 'basic',
+    }
+    headers = {
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+        'User-Agent': 'Mozilla/5.0',
+    }
+    try:
+        r = requests.post(COBALT_API, json=payload, headers=headers, timeout=30)
+        return r.json()
+    except Exception as e:
+        return {'status': 'error', 'error': str(e)}
 
 @app.route('/info', methods=['POST'])
 def info():
@@ -38,30 +61,27 @@ def info():
     if not url or not validate_url(url):
         return jsonify({'error': 'Geçersiz URL'}), 400
 
-    ydl_opts = {
-        'quiet': True, 'no_warnings': True,
-        'socket_timeout': 15, 'noplaylist': True,
-        'extractor_args': {'youtube': {'player_client': ['ios', 'web']}},
-    }
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-    except Exception as e:
-        return jsonify({'error': 'Video bilgisi alınamadı: ' + str(e)}), 500
+    result = cobalt_request(url, 'mp4-720')
+    status = result.get('status', '')
 
-    heights = [f.get('height') for f in info.get('formats', []) if f.get('height')]
-    formats = []
-    max_h = max(heights) if heights else 0
-    if not heights or max_h >= 720:
-        formats.append({'code': 'mp4-720', 'label': 'MP4 — 720p HD'})
-    if max_h >= 1080:
-        formats.append({'code': 'mp4-1080', 'label': 'MP4 — 1080p Full HD'})
-    formats.append({'code': 'mp3', 'label': 'MP3 — Sadece Ses'})
+    if status == 'error':
+        return jsonify({'error': 'Video bulunamadı: ' + str(result.get('error', ''))}), 500
+
+    platform = detect_platform(url)
+    formats = [
+        {'code': 'mp4-720',  'label': 'MP4 — 720p HD'},
+        {'code': 'mp4-1080', 'label': 'MP4 — 1080p Full HD'},
+        {'code': 'mp3',      'label': 'MP3 — Sadece Ses'},
+    ]
+
+    title = result.get('filename', 'Video')
+    title = title.rsplit('.', 1)[0].replace('-', ' ').replace('_', ' ')
 
     return jsonify({
-        'title':     info.get('title', 'Video')[:200],
-        'thumbnail': info.get('thumbnail'),
-        'duration':  info.get('duration'),
+        'title':    title[:200],
+        'thumbnail': None,
+        'duration':  None,
+        'platform':  platform,
         'formats':   formats,
     })
 
@@ -73,61 +93,41 @@ def download():
     fmt = request.args.get('format', 'mp4-720')
     if not url or not validate_url(url):
         return jsonify({'error': 'Geçersiz URL'}), 400
-    if fmt not in FORMAT_MAP:
+    if fmt not in ('mp4-720', 'mp4-1080', 'mp3'):
         return jsonify({'error': 'Geçersiz format'}), 400
+
+    result = cobalt_request(url, fmt)
+    status = result.get('status', '')
+
+    if status == 'error':
+        return jsonify({'error': 'İndirme başarısız: ' + str(result.get('error', ''))}), 500
+
+    # tunnel = Cobalt direkt stream ediyor
+    # redirect = Cobalt başka URL'ye yönlendiriyor
+    # stream = Cobalt stream URL veriyor
+    download_url = result.get('url')
+    if not download_url:
+        return jsonify({'error': 'İndirme linki alınamadı. Cobalt yanıtı: ' + str(result)}), 500
 
     is_audio = fmt == 'mp3'
     ext = 'mp3' if is_audio else 'mp4'
-    tmp = tempfile.mktemp(suffix='.' + ext)
-
-    ydl_opts = {
-        'quiet': True, 'no_warnings': True,
-        'socket_timeout': 30, 'noplaylist': True,
-        'format': FORMAT_MAP[fmt],
-        'outtmpl': tmp,
-        'merge_output_format': ext,
-        'extractor_args': {'youtube': {'player_client': ['ios', 'web']}},
-    }
-    if is_audio:
-        ydl_opts['postprocessors'] = [{
-            'key': 'FFmpegExtractAudio',
-            'preferredcodec': 'mp3',
-            'preferredquality': '0',
-        }]
-
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
-    except Exception as e:
-        return jsonify({'error': 'İndirme başarısız: ' + str(e)}), 500
-
-    # Gerçek dosyayı bul
-    actual = tmp
-    if not os.path.exists(actual):
-        import glob
-        files = glob.glob(tmp.replace('.' + ext, '') + '*')
-        actual = files[0] if files else None
-
-    if not actual or not os.path.exists(actual):
-        return jsonify({'error': 'Dosya oluşturulamadı'}), 500
-
     mime = 'audio/mpeg' if is_audio else 'video/mp4'
     filename = f'videosnap.{ext}'
 
-    def generate():
-        with open(actual, 'rb') as f:
-            while chunk := f.read(8192):
-                yield chunk
-        os.unlink(actual)
-
-    return Response(
-        generate(),
-        mimetype=mime,
-        headers={
-            'Content-Disposition': f'attachment; filename="{filename}"',
-            'Content-Length': str(os.path.getsize(actual)),
-        }
-    )
+    try:
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        r = requests.get(download_url, stream=True, timeout=120, headers=headers)
+        def generate():
+            for chunk in r.iter_content(chunk_size=8192):
+                if chunk:
+                    yield chunk
+        return Response(
+            generate(),
+            mimetype=mime,
+            headers={'Content-Disposition': f'attachment; filename="{filename}"'}
+        )
+    except Exception as e:
+        return jsonify({'error': 'Dosya aktarım hatası: ' + str(e)}), 500
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
