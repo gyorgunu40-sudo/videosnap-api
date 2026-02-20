@@ -41,6 +41,7 @@ def info():
     ydl_opts = {
         'quiet': True, 'no_warnings': True,
         'socket_timeout': 15, 'noplaylist': True,
+        'extractor_args': {'youtube': {'player_client': ['ios', 'web']}},
     }
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -85,6 +86,7 @@ def download():
         'format': FORMAT_MAP[fmt],
         'outtmpl': tmp,
         'merge_output_format': ext,
+        'extractor_args': {'youtube': {'player_client': ['ios', 'web']}},
     }
     if is_audio:
         ydl_opts['postprocessors'] = [{
