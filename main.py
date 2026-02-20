@@ -98,16 +98,16 @@ def download():
 
     result = cobalt_request(url, fmt)
     status = result.get('status', '')
+    
+    import sys
+    print(f"Cobalt yanıtı: {result}", file=sys.stderr)
 
     if status == 'error':
-        return jsonify({'error': 'İndirme başarısız: ' + str(result.get('error', ''))}), 500
+        return jsonify({'error': 'İndirme başarısız: ' + str(result.get('error', result))}), 500
 
-    # tunnel = Cobalt direkt stream ediyor
-    # redirect = Cobalt başka URL'ye yönlendiriyor
-    # stream = Cobalt stream URL veriyor
     download_url = result.get('url')
     if not download_url:
-        return jsonify({'error': 'İndirme linki alınamadı. Cobalt yanıtı: ' + str(result)}), 500
+        return jsonify({'error': f'İndirme linki alınamadı. Status: {status}, Yanıt: {result}'}), 500
 
     is_audio = fmt == 'mp3'
     ext = 'mp3' if is_audio else 'mp4'
